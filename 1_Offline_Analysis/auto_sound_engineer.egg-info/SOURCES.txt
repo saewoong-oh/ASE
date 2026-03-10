@@ -1,0 +1,8 @@
+pyproject.toml
+setup.py
+auto_sound_engineer.egg-info/PKG-INFO
+auto_sound_engineer.egg-info/SOURCES.txt
+auto_sound_engineer.egg-info/dependency_links.txt
+auto_sound_engineer.egg-info/top_level.txt
+cpp/bindings.cpp
+cpp/dft_engine.cpp

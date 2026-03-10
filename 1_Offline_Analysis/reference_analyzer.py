@@ -4,7 +4,7 @@ Reference analyzer — AGGRESSIVE filtering for realistic note counts.
 
 import numpy as np
 import ase_core
-from python.frequency_map import FrequencyMap, StemProfile
+from frequency_map import FrequencyMap, StemProfile
 
 
 def _vec(x):
