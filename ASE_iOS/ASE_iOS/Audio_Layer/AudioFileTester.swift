@@ -3,7 +3,8 @@ import AVFoundation
 import Combine
 
 // MARK: - JSON model
-struct FrequencyMapData: Codable {
+// Nonisolated so it can be decoded off the main actor
+struct FrequencyMapData: Codable, Sendable {
     let stem_names: [String]
     let combined_chroma: [[Double]]
     let stems_rms: [String: [Double]]
@@ -23,9 +24,9 @@ class AudioFileTester: ObservableObject {
     private let engineWrapper = ASEWrapper()
 
     // ── AVAudio ───────────────────────────────────────────────────────────
-    private var avEngine:   AVAudioEngine?    = nil
+    private var avEngine:   AVAudioEngine?     = nil
     private var playerNode: AVAudioPlayerNode? = nil
-    private var tapNode:    AVAudioNode?       = nil
+    private var tapNode:    AVAudioNode?        = nil
     private var tapInstalled = false
 
     // ── Published state ───────────────────────────────────────────────────
@@ -41,6 +42,10 @@ class AudioFileTester: ObservableObject {
     @Published var isReady:        Bool = false
     @Published var trackingMode:   TrackingMode = .idle
 
+    @Published var tapCallCount:    Int    = 0
+    @Published var processCallCount: Int   = 0
+    @Published var lastResultKeys:  [String] = []
+
     var isPlaying:   Bool { trackingMode == .playingFile  }
     var isListening: Bool { trackingMode == .listeningMic }
 
@@ -50,11 +55,20 @@ class AudioFileTester: ObservableObject {
         stopAll()
         DispatchQueue.main.async { self.isReady = false }
 
+        print("=== loadReferenceData: \(jsonURL.lastPathComponent)")
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             do {
                 let data    = try Data(contentsOf: jsonURL)
+                print("=== JSON bytes: \(data.count)")
+
                 let decoded = try JSONDecoder().decode(FrequencyMapData.self, from: data)
+                print("=== Decoded stems: \(decoded.stem_names)  "
+                      + "chroma frames: \(decoded.combined_chroma.count)")
+                for (k, v) in decoded.stems_rms {
+                    print("=== stems_rms[\(k)]: \(v.count) frames  peak=\(v.max() ?? 0)")
+                }
 
                 let chromaNS = decoded.combined_chroma.map { row in
                     row.map { NSNumber(value: $0) }
@@ -64,9 +78,12 @@ class AudioFileTester: ObservableObject {
                     rmsNS[k] = v.map { NSNumber(value: $0) }
                 }
 
+                print("=== Calling loadReferenceChroma …")
                 self.engineWrapper.loadReferenceChroma(chromaNS,
                                                        stemNames: decoded.stem_names,
                                                        stemRMS: rmsNS)
+                print("=== loadReferenceChroma returned.")
+
                 DispatchQueue.main.async {
                     self.stemNames     = decoded.stem_names
                     self.totalDuration = Double(decoded.combined_chroma.count)
@@ -79,9 +96,10 @@ class AudioFileTester: ObservableObject {
                     self.stemLiveDB    = [:]
                     self.stemRefDB     = [:]
                     self.isReady       = true
+                    print("=== isReady = true  stemNames = \(self.stemNames)")
                 }
             } catch {
-                print("Failed to load reference JSON: \(error)")
+                print("=== FAILED to load reference JSON: \(error)")
             }
         }
     }
@@ -89,46 +107,62 @@ class AudioFileTester: ObservableObject {
     // MARK: - File playback
 
     func runTest(with audioFileURL: URL) {
-        guard isReady else { print("Engine not ready"); return }
+        print("=== runTest called. isReady=\(isReady)")
+        guard isReady else {
+            print("=== ENGINE NOT READY — aborting")
+            return
+        }
 
         destroyEngine()
         engineWrapper.resetTracker()
+        print("=== tracker reset")
 
-        refTime       = 0
-        progress      = 0
-        confidence    = 0
-        overallGainDB = 0
+        refTime          = 0
+        progress         = 0
+        confidence       = 0
+        overallGainDB    = 0
+        tapCallCount     = 0
+        processCallCount = 0
+        lastResultKeys   = []
 
         setupAudioSession(forMic: false)
 
         do {
             let audioFile  = try AVAudioFile(forReading: audioFileURL)
             let fileFormat = audioFile.processingFormat
+            print("=== AVAudioFile format: \(fileFormat)")
+            print(String(format: "=== File: %lld frames @ %.0f Hz = %.1f s",
+                         audioFile.length,
+                         fileFormat.sampleRate,
+                         Double(audioFile.length) / fileFormat.sampleRate))
 
             let engine = AVAudioEngine()
             let player = AVAudioPlayerNode()
             engine.attach(player)
             engine.connect(player, to: engine.mainMixerNode, format: fileFormat)
 
+            print("=== Installing tap on mainMixerNode …")
             installTap(on: engine.mainMixerNode, engine: engine)
 
             try engine.start()
+            print("=== Engine started.")
 
             player.scheduleFile(audioFile, at: nil) { [weak self] in
                 DispatchQueue.main.async {
                     guard let self, self.trackingMode == .playingFile else { return }
+                    print("=== Playback finished.")
                     self.trackingMode = .idle
                 }
             }
             player.play()
+            print("=== Player playing.")
 
             avEngine   = engine
             playerNode = player
-
             trackingMode = .playingFile
 
         } catch {
-            print("Failed to start file playback: \(error)")
+            print("=== FAILED to start file playback: \(error)")
         }
     }
 
@@ -140,38 +174,31 @@ class AudioFileTester: ObservableObject {
         destroyEngine()
         engineWrapper.resetTracker()
 
-        refTime       = 0
-        progress      = 0
-        confidence    = 0
-        overallGainDB = 0
+        refTime          = 0
+        progress         = 0
+        confidence       = 0
+        overallGainDB    = 0
+        tapCallCount     = 0
+        processCallCount = 0
+        lastResultKeys   = []
 
         setupAudioSession(forMic: true)
 
-        let engine    = AVAudioEngine()
-        let inputNode = engine.inputNode
+        let engine      = AVAudioEngine()
+        let inputNode   = engine.inputNode
         let inputFormat = inputNode.outputFormat(forBus: 0)
-
         print("Mic input format: \(inputFormat)")
-        print("Mic input channel count: \(inputFormat.channelCount)")
-        print("Mic input sample rate: \(inputFormat.sampleRate)")
 
-        // ── Connect input → mixer so we can hear what the mic is picking up ──
-        // This lets you verify the mic is actually receiving signal.
-        // The mixer will play the mic signal through the speaker/headphones.
-        // WARNING: if using the built-in speaker without headphones this will
-        // cause feedback — use headphones when testing this mode.
         engine.connect(inputNode, to: engine.mainMixerNode, format: inputFormat)
-        engine.mainMixerNode.outputVolume = 1.0   // audible monitoring ON
+        engine.mainMixerNode.outputVolume = 1.0
 
-        // Tap the input node directly for the DSP pipeline
         installTap(on: inputNode, engine: engine)
 
         do {
             try engine.start()
             avEngine     = engine
             trackingMode = .listeningMic
-            print("Mic tracking started with monitoring enabled.")
-            print("You should now hear the mic input through the speaker/headphones.")
+            print("Mic tracking started.")
         } catch {
             print("Failed to start mic engine: \(error)")
             removeTap()
@@ -181,6 +208,7 @@ class AudioFileTester: ObservableObject {
     // MARK: - Stop
 
     func stopAll() {
+        print("=== stopAll — tapCalls=\(tapCallCount) processCalls=\(processCallCount)")
         destroyEngine()
         trackingMode = .idle
     }
@@ -189,20 +217,14 @@ class AudioFileTester: ObservableObject {
 
     private func destroyEngine() {
         removeTap()
-
         if let engine = avEngine {
-            if let player = playerNode, engine.isRunning {
-                player.stop()
-            }
+            if let player = playerNode, engine.isRunning { player.stop() }
             if engine.isRunning {
                 engine.mainMixerNode.outputVolume = 1.0
                 engine.stop()
             }
-            if let player = playerNode {
-                engine.detach(player)
-            }
+            if let player = playerNode { engine.detach(player) }
         }
-
         avEngine   = nil
         playerNode = nil
     }
@@ -213,35 +235,27 @@ class AudioFileTester: ObservableObject {
         let session = AVAudioSession.sharedInstance()
         do {
             if forMic {
-                // Use .playAndRecord so we can both capture AND monitor
-                // Use headphones to avoid feedback when monitoring is on
                 try session.setCategory(.playAndRecord,
                                         mode: .measurement,
-                                        options: [.allowBluetooth,
+                                        options: [.allowBluetoothHFP,
                                                   .allowBluetoothA2DP])
-                // Explicitly prefer the built-in mic
                 if let builtInMic = session.availableInputs?.first(where: {
                     $0.portType == .builtInMic
                 }) {
                     try session.setPreferredInput(builtInMic)
-                    print("Preferred input set to: \(builtInMic.portName)")
-                } else {
-                    print("WARNING: built-in mic not found, using default input")
                 }
             } else {
                 try session.setCategory(.playAndRecord,
                                         mode: .measurement,
                                         options: [.defaultToSpeaker,
-                                                  .allowBluetooth])
+                                                  .allowBluetoothHFP])
             }
             try session.setActive(true)
-
-            // Log what's actually active
-            print("Audio session input: \(session.currentRoute.inputs.map { $0.portName })")
-            print("Audio session output: \(session.currentRoute.outputs.map { $0.portName })")
-
+            print("=== Audio session: "
+                  + "in=\(session.currentRoute.inputs.map{$0.portName}) "
+                  + "out=\(session.currentRoute.outputs.map{$0.portName})")
         } catch {
-            print("Audio session error: \(error)")
+            print("=== Audio session error: \(error)")
         }
     }
 
@@ -249,24 +263,28 @@ class AudioFileTester: ObservableObject {
 
     private func installTap(on node: AVAudioNode, engine: AVAudioEngine) {
         let fmt = node.outputFormat(forBus: 0)
-        print("Installing tap with format: \(fmt)")
-        node.installTap(onBus: 0, bufferSize: 1024, format: fmt) { [weak self] buf, time in
-            // Log signal level occasionally so we can see if the tap is
-            // receiving real signal or silence
+        print("=== installTap: \(type(of: node))  sr=\(fmt.sampleRate)  ch=\(fmt.channelCount)")
+
+        node.installTap(onBus: 0, bufferSize: 1024, format: fmt) { [weak self] buf, _ in
+            guard let self else { return }
+
             if let data = buf.floatChannelData {
-                let frameCount = Int(buf.frameLength)
+                let n = Int(buf.frameLength)
                 var sum: Float = 0
-                for i in 0..<frameCount { sum += data[0][i] * data[0][i] }
-                let rms = sqrt(sum / Float(frameCount))
+                for i in 0..<n { sum += data[0][i] * data[0][i] }
+                let rms = sqrt(sum / Float(n))
                 if rms > 0.001 {
-                    // Only print when there's meaningful signal
                     print(String(format: "TAP RMS: %.5f", rms))
                 }
             }
-            self?.processTapBuffer(buffer: buf)
+
+            let callNum = self.tapCallCount + 1
+            DispatchQueue.main.async { self.tapCallCount = callNum }
+            self.processTapBuffer(buffer: buf, tapCallNumber: callNum)
         }
         tapNode      = node
         tapInstalled = true
+        print("=== Tap installed.")
     }
 
     private func removeTap() {
@@ -274,14 +292,21 @@ class AudioFileTester: ObservableObject {
         node.removeTap(onBus: 0)
         tapNode      = nil
         tapInstalled = false
+        print("=== Tap removed.")
     }
 
     // MARK: - DSP
 
-    private func processTapBuffer(buffer: AVAudioPCMBuffer) {
-        guard let channelData = buffer.floatChannelData else { return }
+    private func processTapBuffer(buffer: AVAudioPCMBuffer, tapCallNumber: Int) {
+        guard let channelData = buffer.floatChannelData else {
+            print("=== processTapBuffer #\(tapCallNumber): no channelData")
+            return
+        }
         let frameLength = Int(buffer.frameLength)
-        guard frameLength > 0 else { return }
+        guard frameLength > 0 else {
+            print("=== processTapBuffer #\(tapCallNumber): frameLength=0")
+            return
+        }
 
         let ch   = Int(buffer.format.channelCount)
         var mono = [Double](repeating: 0, count: frameLength)
@@ -293,8 +318,31 @@ class AudioFileTester: ObservableObject {
             for i in 0..<frameLength { mono[i] = Double(c0[i]) }
         }
 
+        if tapCallNumber <= 5 {
+            let monoRMS = sqrt(mono.map{$0*$0}.reduce(0,+) / Double(mono.count))
+            print(String(format: "=== processTapBuffer #%d  frames=%d  ch=%d  monoRMS=%.6f",
+                         tapCallNumber, frameLength, ch, monoRMS))
+        }
+
         let raw: [AnyHashable: Any] = mono.withUnsafeBufferPointer { ptr in
             self.engineWrapper.processBlock(ptr.baseAddress!, length: frameLength)
+        }
+
+        if tapCallNumber <= 10 {
+            print("=== processBlock returned \(raw.count) keys: \(raw.keys.map{"\($0)"})")
+            if let conf = raw["confidence"] as? NSNumber {
+                print(String(format: "    confidence=%.4f", conf.doubleValue))
+            }
+            if let pos = raw["position"] as? NSNumber {
+                print("    position=\(pos.intValue)")
+            }
+        }
+
+        if !raw.isEmpty {
+            DispatchQueue.main.async {
+                self.processCallCount += 1
+                self.lastResultKeys = raw.keys.compactMap { $0 as? String }
+            }
         }
 
         DispatchQueue.main.async { self.unpackStatus(raw) }

@@ -12,6 +12,10 @@ Usage:
 
 Output:
     ref_data/map_jazz_trio.json   ← drag this into Xcode
+
+IMPORTANT: The reference RMS values are computed from the FULL MIX, not
+from isolated stems. This matches what the iOS live estimator will see
+(a mixed signal measured in each stem's characteristic frequency band).
 """
 
 import argparse, json, os, re, sys
@@ -38,33 +42,96 @@ def sanitize_filename(name: str) -> str:
     return safe or "map"
 
 
-def compute_band_rms_sequence(audio, sr, fft_size=4096, hop_size=1024, bands=None):
+def load_audio_mono(path: str, target_sr: int = 44100) -> np.ndarray:
+    """Load any audio file as mono float64 at target_sr."""
+    try:
+        import soundfile as sf
+        audio, sr = sf.read(path, always_2d=False)
+        if audio.ndim == 2:
+            audio = audio.mean(axis=1)
+        if sr != target_sr:
+            try:
+                import resampy
+                audio = resampy.resample(audio, sr, target_sr)
+                print(f"      Resampled {sr} → {target_sr} Hz")
+            except ImportError:
+                print(f"      WARNING: resampy not installed; audio stays at {sr} Hz")
+        return np.ascontiguousarray(audio, dtype=np.float64)
+    except Exception:
+        try:
+            import librosa
+            audio, _ = librosa.load(path, sr=target_sr, mono=True)
+            return np.ascontiguousarray(audio, dtype=np.float64)
+        except Exception as e:
+            print(f"ERROR loading {path}: {e}")
+            sys.exit(1)
+
+
+def compute_band_rms_from_mix(mix_audio: np.ndarray,
+                               sr: int,
+                               stem_names: list,
+                               fft_size: int = 4096,
+                               hop_size: int = 1024) -> dict:
     """
-    Compute per-hop band-limited RMS — mirrors ASEWrapper.mm estimateStemRMS exactly.
+    Compute per-stem band-limited RMS sequences from the FULL MIX audio.
+
+    This is the correct approach because:
+      - The iOS tap sees the full mix (playback or mic).
+      - Each stem's band is measured from that same mixed signal.
+      - So the reference must also be measured from the mix in those bands.
+
+    The band definitions tell us WHICH frequency region is characteristic
+    of each stem, but we always measure from the same mixed signal — both
+    here (offline) and on iOS (live).
+
+    Formula: sqrt(mean(magnitude[low_bin:high_bin]^2))
+    This matches ASEWrapper.mm computeBandEnergy exactly.
     """
     import ase_core
+
     stft     = ase_core.STFT(fft_size, hop_size, sr, ase_core.Window.HANN)
-    n_frames = max(0, (len(audio) - fft_size) // hop_size + 1)
-    seq      = []
+    n_frames = max(0, (len(mix_audio) - fft_size) // hop_size + 1)
+
+    # Pre-allocate output arrays
+    result = {name: np.zeros(n_frames, dtype=np.float64) for name in stem_names}
 
     for idx in range(n_frames):
         start = idx * hop_size
-        chunk = np.ascontiguousarray(audio[start:start + fft_size], dtype=np.float64)
+        chunk = np.ascontiguousarray(mix_audio[start:start + fft_size],
+                                     dtype=np.float64)
         frame = stft.analyze_frame(chunk, start / sr)
-        mag   = np.array(frame.magnitude)
-        band_energy = 0.0
+        mag   = np.array(frame.magnitude)   # shape: (fft_size//2 + 1,)
 
-        for (low_hz, high_hz, weight) in bands:
-            low_bin  = max(1, int(np.ceil(low_hz  * fft_size / sr)))
-            high_bin = min(len(mag) - 1, int(np.floor(high_hz * fft_size / sr)))
-            if low_bin > high_bin:
-                continue
-            energy = np.sqrt(np.mean(mag[low_bin:high_bin + 1] ** 2))
-            band_energy += energy * weight
+        for name in stem_names:
+            bands       = STEM_BANDS.get(name, DEFAULT_BAND)
+            band_energy = 0.0
+            for (low_hz, high_hz, weight) in bands:
+                lo = max(1, int(np.ceil (low_hz  * fft_size / sr)))
+                hi = min(len(mag) - 1,
+                         int(np.floor(high_hz * fft_size / sr)))
+                if lo > hi:
+                    continue
+                # sqrt(mean(mag^2)) — identical to iOS computeBandEnergy
+                e = float(np.sqrt(np.mean(mag[lo:hi + 1] ** 2)))
+                band_energy += e * weight
+            result[name][idx] = band_energy
 
-        seq.append(float(band_energy))
+        if n_frames >= 1000 and idx % 1000 == 0:
+            print(f"      band-RMS frame {idx}/{n_frames} …", end="\r", flush=True)
 
-    return seq
+    if n_frames >= 1000:
+        print(f"      band-RMS {n_frames} frames done.          ")
+
+    # Convert to lists and print stats
+    out = {}
+    for name in stem_names:
+        seq  = result[name].tolist()
+        peak = float(result[name].max()) if n_frames > 0 else 0.0
+        mean = float(result[name].mean()) if n_frames > 0 else 0.0
+        print(f"      {name:8s}: {n_frames} frames  "
+              f"mean={mean:.5f}  peak={peak:.5f}")
+        out[name] = seq
+    return out
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -72,7 +139,7 @@ def compute_band_rms_sequence(audio, sr, fft_size=4096, hop_size=1024, bands=Non
 def run(ref_path: str,
         display_name: str,
         out_dir: str,
-        sr: int      = 44100,
+        sr: int       = 44100,
         fft_size: int = 4096,
         hop_size: int = 1024,
         peak_db: float = -60.0,
@@ -84,41 +151,49 @@ def run(ref_path: str,
         print("ERROR: C++ extension not built.  Run:  pip install .")
         sys.exit(1)
 
-    from stem_separator    import separate, load_stem
+    from stem_separator     import separate, load_stem
     from reference_analyzer import analyze_reference
-    from frequency_map      import FrequencyMap
 
     os.makedirs(out_dir, exist_ok=True)
 
-    file_stem    = sanitize_filename(display_name)   # e.g. "jazz_trio"
-    map_stem     = f"map_{file_stem}"                # e.g. "map_jazz_trio"
-    gz_path      = os.path.join(out_dir, f"{map_stem}.gz")
-    json_path    = os.path.join(out_dir, f"{map_stem}.json")
+    file_stem = sanitize_filename(display_name)
+    map_stem  = f"map_{file_stem}"
+    gz_path   = os.path.join(out_dir, f"{map_stem}.gz")
+    json_path = os.path.join(out_dir, f"{map_stem}.json")
 
     print(f"\n  Display name : {display_name}")
     print(f"  File stem    : {map_stem}")
     print(f"  Output dir   : {out_dir}")
 
-    # ── 1. Stem separation ───────────────────────────────────────────────────
-    print(f"\n[1/3] Separating stems with Demucs …")
+    # ── 1. Load full mix (mono) for band-RMS reference ───────────────────────
+    # We load this NOW before Demucs runs, from the original source file.
+    # This guarantees we have the exact same signal the iOS player will play.
+    print(f"\n[0/3] Loading full mix for reference RMS …")
     print(f"      source : {ref_path}")
+    mix_audio = load_audio_mono(ref_path, target_sr=sr)
+    mix_dur   = len(mix_audio) / sr
+    mix_frames = max(0, (len(mix_audio) - fft_size) // hop_size + 1)
+    print(f"      {len(mix_audio)} samples @ {sr} Hz = {mix_dur:.1f}s  "
+          f"→ {mix_frames} STFT frames")
+
+    # ── 2. Stem separation ───────────────────────────────────────────────────
+    print(f"\n[1/3] Separating stems with Demucs …")
     stem_paths = separate(ref_path, out_dir)
     print(f"      stems  : {list(stem_paths.keys())}")
 
-    # ── 2. Load stems ────────────────────────────────────────────────────────
+    # ── 3. Load stems ────────────────────────────────────────────────────────
     print(f"\n[2/3] Loading stems …")
-    stems      = {}
-    stem_audio = {}   # keep raw audio for band-RMS computation later
+    stems = {}
     for name, path in stem_paths.items():
         audio, stem_sr = load_stem(path, target_sr=sr)
-        stems[name]      = (audio, stem_sr)
-        stem_audio[name] = (audio, stem_sr)
-        dur = len(audio) / stem_sr
-        print(f"      {name:8s}  {dur:.1f}s  sr={stem_sr}")
+        stems[name] = (audio, stem_sr)
+        print(f"      {name:8s}  {len(audio)/stem_sr:.1f}s  sr={stem_sr}")
 
-    # ── 3. C++ DFT analysis ──────────────────────────────────────────────────
+    # ── 4. C++ DFT analysis (chroma + notes, uses isolated stems) ───────────
     print(f"\n[3/3] Running C++ DFT analysis …")
     fmap = analyze_reference(stems,
+                             full_mix=mix_audio,
+                             full_mix_sr=sr,
                              fft_size=fft_size,
                              hop_size=hop_size,
                              peak_threshold_db=peak_db)
@@ -129,45 +204,40 @@ def run(ref_path: str,
     print(f"  Notes  : {total_notes}")
     for name, s in fmap.stems.items():
         peak = max(s.rms) if s.rms else 0.0
-        print(f"  [{name:8s}]  notes={len(s.notes):4d}  peak RMS={peak:.4f}")
+        print(f"  [{name:8s}]  notes={len(s.notes):4d}  peak broadband RMS={peak:.4f}")
 
-    # Optionally persist the .gz (useful for re-exporting without re-analyzing)
     if keep_gz:
         fmap.serialize(gz_path)
         print(f"\n  .gz saved : {gz_path}")
 
-    # ── 4. Export iOS JSON ───────────────────────────────────────────────────
-    print(f"\nExporting iOS JSON …")
+    # ── 5. Compute band-RMS from FULL MIX ────────────────────────────────────
+    # This is the critical step: measure each stem's characteristic band
+    # from the mixed signal, NOT from isolated stems.
+    print(f"\nComputing band-RMS from full mix …")
+    stem_names     = fmap.stem_names()
+    stems_band_rms = compute_band_rms_from_mix(
+        mix_audio, sr, stem_names,
+        fft_size=fft_size,
+        hop_size=hop_size)
 
-    BAND_FRACTION = {
-        "drums": 0.35, "bass": 0.40, "vocals": 0.45,
-        "other": 0.30, "guitar": 0.30, "piano": 0.30, "keys": 0.30,
-    }
+    # Sanity check: warn if frame counts don't match chroma
+    chroma_frames = len(fmap.combined_chroma)
+    if mix_frames != chroma_frames:
+        print(f"\n  NOTE: mix frames ({mix_frames}) != chroma frames ({chroma_frames}). "
+              f"Trimming/padding to match chroma.")
 
-    stems_band_rms = {}
-    for name, profile in fmap.stems.items():
-        bands = STEM_BANDS.get(name, DEFAULT_BAND)
+    # Align all RMS sequences to chroma frame count
+    for name in stem_names:
+        seq = stems_band_rms[name]
+        if len(seq) < chroma_frames:
+            stems_band_rms[name] = seq + [0.0] * (chroma_frames - len(seq))
+        elif len(seq) > chroma_frames:
+            stems_band_rms[name] = seq[:chroma_frames]
 
-        if name in stem_audio:
-            audio, stem_sr = stem_audio[name]
-            band_rms = compute_band_rms_sequence(
-                audio, stem_sr,
-                fft_size=fft_size,
-                hop_size=hop_size,
-                bands=bands)
-        else:
-            # Fallback: scale broadband RMS (should never happen in normal use)
-            scale    = BAND_FRACTION.get(name, 0.35)
-            band_rms = [r * scale for r in profile.rms]
-            print(f"  WARNING: {name} — using broadband RMS × {scale:.2f} (no raw audio)")
-
-        stems_band_rms[name] = band_rms
-        peak = max(band_rms) if band_rms else 0.0
-        print(f"  {name:8s}: {len(band_rms)} frames, peak band RMS = {peak:.5f}")
-
+    # ── 6. Write JSON ─────────────────────────────────────────────────────────
     data = {
         "display_name":    display_name,
-        "stem_names":      fmap.stem_names(),
+        "stem_names":      stem_names,
         "combined_chroma": fmap.combined_chroma.tolist(),
         "stems_rms":       stems_band_rms,
     }
@@ -175,9 +245,11 @@ def run(ref_path: str,
     with open(json_path, 'w') as f:
         json.dump(data, f)
 
+    size_mb = os.path.getsize(json_path) / 1e6
+
     # ── Summary ──────────────────────────────────────────────────────────────
     print(f"\n{'─'*60}")
-    print(f"  ✓  JSON ready : {json_path}")
+    print(f"  ✓  JSON ready : {json_path}  ({size_mb:.1f} MB)")
     print(f"{'─'*60}")
     print(f"\n  1. Drag  {os.path.basename(json_path)}  into your Xcode project")
     print(f"     (tick 'Copy items if needed', add to your app target)")
@@ -212,8 +284,7 @@ def main():
     ap.add_argument("--peak-db", type=float, default=-60.0,
                     help="Peak detection threshold in dB  (default: -60)")
     ap.add_argument("--keep-gz", action="store_true",
-                    help="Also save the intermediate .gz file "
-                         "(lets you re-export JSON without re-running Demucs)")
+                    help="Also save the intermediate .gz file")
 
     args = ap.parse_args()
 
