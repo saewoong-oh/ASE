@@ -14,8 +14,8 @@ def _vec(x):
 # ══════════════════════════════════════════════════════════
 #  TUNED PARAMETERS — these are the ones that matter
 # ══════════════════════════════════════════════════════════
-DEFAULT_PEAK_THRESHOLD_DB = -35.0   # ignore everything below -35 dB
-MAX_PEAKS_PER_FRAME       = 8       # only top 8 — fundamental + harmonics
+DEFAULT_PEAK_THRESHOLD_DB = -20.0   # ignore everything below -35 dB
+MAX_PEAKS_PER_FRAME       = 4       # only top 4 — fundamental + harmonics
 MIN_PARTIAL_DURATION      = 0.08    # partials shorter than 80ms = noise
 PARTIAL_TOLERANCE_CENTS   = 50.0    # frequency matching window
 MAX_PARTIAL_GAP_FRAMES    = 2       # max 2 missed frames before death
