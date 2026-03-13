@@ -1,3 +1,11 @@
+# Deprecated method
+
+
+
+
+
+
+
 #!/usr/bin/env python3
 """
 Export a .gz frequency map to a .json file ready for Xcode.

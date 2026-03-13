@@ -2,7 +2,12 @@
 FrequencyMap : the central data-store that maps
   (stem, time-index) → {frequencies, amplitudes, RMS, chroma, notes}
 
-Used both for song-position identification and for RMS matching.
+Used both for song-position identification (via chroma matching) and
+for RMS-based mix advisory (target gain calculation per stem).
+
+This module defines two core data classes:
+  - StemProfile: per-frame analysis data for a single instrument stem
+  - FrequencyMap: top-level container holding all stems plus combined chroma
 """
 
 from dataclasses import dataclass, field
@@ -12,37 +17,51 @@ import numpy as np
 
 @dataclass
 class StemProfile:
-    """All per-frame analysis data for one stem."""
+    """
+    All per-frame analysis data for one separated stem (e.g., vocals, drums).
+    
+    Each list is indexed by frame number. The frame rate is determined by
+    hop_size / sample_rate (typically ~23.2ms per frame at 44100 Hz / 1024 hop).
+    """
     name:       str
-    times:      list[float]                = field(default_factory=list)
-    peak_freqs: list[list[float]]          = field(default_factory=list)
-    peak_amps:  list[list[float]]          = field(default_factory=list)
-    rms:        list[float]                = field(default_factory=list)
-    chroma:     list[Any]                  = field(default_factory=list)
-    partials:   list                       = field(default_factory=list)
-    notes:      list                       = field(default_factory=list)
+    times:      list[float]                = field(default_factory=list)   # Timestamp (seconds) of each frame center
+    peak_freqs: list[list[float]]          = field(default_factory=list)   # Detected spectral peak frequencies per frame
+    peak_amps:  list[list[float]]          = field(default_factory=list)   # Amplitudes of detected peaks per frame
+    rms:        list[float]                = field(default_factory=list)   # Root-mean-square energy per frame
+    chroma:     list[Any]                  = field(default_factory=list)   # 12-bin chroma vector per frame
+    partials:   list                       = field(default_factory=list)   # Tracked sinusoidal partials (from PartialTracker)
+    notes:      list                       = field(default_factory=list)   # Extracted musical notes (from partial grouping)
 
     # ---- queries ------------------------------------------------
+
     def rms_at(self, frame_idx: int) -> float:
+        """Return RMS energy at a specific frame index, or 0.0 if out of bounds."""
         if 0 <= frame_idx < len(self.rms):
             return self.rms[frame_idx]
         return 0.0
 
     def rms_at_time(self, t: float) -> float:
+        """Return RMS energy at the frame nearest to time t (seconds)."""
         idx = self._time_to_idx(t)
         return self.rms_at(idx)
 
     def chroma_at(self, frame_idx: int) -> np.ndarray:
+        """Return the 12-bin chroma vector at a frame index, or zeros if out of bounds."""
         if 0 <= frame_idx < len(self.chroma):
             return np.asarray(self.chroma[frame_idx])
         return np.zeros(12)
 
     def freqs_at(self, frame_idx: int) -> list[float]:
+        """Return the list of detected peak frequencies at a frame index."""
         if 0 <= frame_idx < len(self.peak_freqs):
             return self.peak_freqs[frame_idx]
         return []
 
     def _time_to_idx(self, t: float) -> int:
+        """
+        Binary search to find the frame index closest to time t.
+        Returns the index of the first frame with time >= t.
+        """
         if not self.times:
             return 0
         lo, hi = 0, len(self.times) - 1
@@ -57,46 +76,62 @@ class StemProfile:
 
 @dataclass
 class FrequencyMap:
-    """Top-level container for full reference analysis."""
+    """
+    Top-level container for the complete reference analysis of a song.
+    
+    Holds per-stem StemProfile objects and a combined chromagram derived
+    from either the original mix or a fallback sum of stem chromas.
+    This is the primary data structure serialized for the iOS app.
+    """
     stems:             dict[str, StemProfile] = field(default_factory=dict)
-    combined_chroma:   np.ndarray = field(default_factory=lambda: np.empty(0))
-    sr:                int = 44100
-    fft_size:          int = 4096
-    hop_size:          int = 1024
+    combined_chroma:   np.ndarray = field(default_factory=lambda: np.empty(0))  # Shape [n_frames, 12]
+    sr:                int = 44100     # Sample rate used during analysis
+    fft_size:          int = 4096     # FFT window size
+    hop_size:          int = 1024     # Hop size between consecutive frames
 
     @property
     def n_frames(self) -> int:
+        """Total number of analysis frames in the combined chromagram."""
         return len(self.combined_chroma)
 
     @property
     def frame_duration(self) -> float:
+        """Duration of one analysis frame in seconds."""
         return self.hop_size / self.sr
 
     def time_of_frame(self, idx: int) -> float:
+        """Convert a frame index to its corresponding time in seconds."""
         return idx * self.frame_duration
 
     def stem_names(self) -> list[str]:
+        """Return the list of stem names present in this map."""
         return list(self.stems.keys())
 
     # ---- lookup at a reference frame index ----------------------
+
     def rms_snapshot(self, frame_idx: int) -> dict[str, float]:
-        """Return {stem_name: rms} at a given reference frame."""
+        """Return a dict of {stem_name: rms} for all stems at a given reference frame."""
         return {name: s.rms_at(frame_idx)
                 for name, s in self.stems.items()}
 
     def chroma_at(self, frame_idx: int) -> np.ndarray:
+        """Return the combined 12-bin chroma vector at a frame index."""
         if 0 <= frame_idx < len(self.combined_chroma):
             return self.combined_chroma[frame_idx]
         return np.zeros(12)
 
     def serialize(self, path: str):
-        """Persist to disk by flattening C++ objects into Python dicts."""
+        """
+        Persist the FrequencyMap to disk as a gzipped pickle file.
+        
+        C++ objects (ase_core.Partial, ase_core.Note) are converted to plain
+        Python dicts so that the file can be loaded without the C++ extension.
+        """
         import pickle, gzip
         
-        # We need to transform the data structure to remove C++ objects
         serializable_stems = {}
         for name, profile in self.stems.items():
-            # Convert partials (ase_core.Partial) to dicts
+            # Convert C++ Partial objects to serializable dicts
             clean_partials = []
             for p in profile.partials:
                 clean_partials.append({
@@ -107,7 +142,7 @@ class FrequencyMap:
                     'phases': list(p.phases)
                 })
             
-            # Convert notes (ase_core.Note) to dicts
+            # Convert C++ Note objects to serializable dicts
             clean_notes = []
             for n in profile.notes:
                 clean_notes.append({
@@ -118,7 +153,6 @@ class FrequencyMap:
                     'midi': n.midi
                 })
 
-            # Create a serializable version of the StemProfile
             serializable_stems[name] = {
                 'times': profile.times,
                 'peak_freqs': profile.peak_freqs,
@@ -142,7 +176,14 @@ class FrequencyMap:
 
     @staticmethod
     def load(path: str) -> "FrequencyMap":
-        """Load from disk and reconstruct the FrequencyMap / StemProfile objects."""
+        """
+        Load a FrequencyMap from a gzipped pickle file and reconstruct
+        StemProfile objects.
+        
+        Note: partials and notes are loaded as plain dicts, not C++ objects.
+        This is sufficient for Python-side usage; reconstructing C++ types
+        would require an additional conversion step.
+        """
         import pickle, gzip
         with gzip.open(path, "rb") as f:
             data = pickle.load(f)
@@ -154,9 +195,6 @@ class FrequencyMap:
             hop_size=data['hop_size']
         )
 
-        # Reconstruct StemProfile objects
-        # Note: partials/notes remain as dicts here, which is fine for Python use.
-        # If your C++ engine needs them back as C++ types, you'd need a reconstruction loop.
         for name, s_data in data['stems'].items():
             profile = StemProfile(
                 name=name,
@@ -171,107 +209,3 @@ class FrequencyMap:
             fmap.stems[name] = profile
             
         return fmap
-
-# """
-# FrequencyMap : the central data-store that maps
-#   (stem, time-index) → {frequencies, amplitudes, RMS, chroma, notes}
-
-# Used both for song-position identification and for RMS matching.
-# """
-
-# from dataclasses import dataclass, field
-# from typing import Any
-# import numpy as np
-
-
-# @dataclass
-# class StemProfile:
-#     """All per-frame analysis data for one stem."""
-#     name:       str
-#     times:      list[float]              = field(default_factory=list)
-#     peak_freqs: list[list[float]]        = field(default_factory=list)
-#     peak_amps:  list[list[float]]        = field(default_factory=list)
-#     rms:        list[float]              = field(default_factory=list)
-#     chroma:     list[Any]                = field(default_factory=list)
-#     partials:   list                     = field(default_factory=list)
-#     notes:      list                     = field(default_factory=list)
-
-#     # ---- queries ------------------------------------------------
-#     def rms_at(self, frame_idx: int) -> float:
-#         if 0 <= frame_idx < len(self.rms):
-#             return self.rms[frame_idx]
-#         return 0.0
-
-#     def rms_at_time(self, t: float) -> float:
-#         idx = self._time_to_idx(t)
-#         return self.rms_at(idx)
-
-#     def chroma_at(self, frame_idx: int) -> np.ndarray:
-#         if 0 <= frame_idx < len(self.chroma):
-#             return np.asarray(self.chroma[frame_idx])
-#         return np.zeros(12)
-
-#     def freqs_at(self, frame_idx: int) -> list[float]:
-#         if 0 <= frame_idx < len(self.peak_freqs):
-#             return self.peak_freqs[frame_idx]
-#         return []
-
-#     def _time_to_idx(self, t: float) -> int:
-#         if not self.times:
-#             return 0
-#         # binary search
-#         lo, hi = 0, len(self.times) - 1
-#         while lo < hi:
-#             mid = (lo + hi) // 2
-#             if self.times[mid] < t:
-#                 lo = mid + 1
-#             else:
-#                 hi = mid
-#         return lo
-
-
-# @dataclass
-# class FrequencyMap:
-#     """Top-level container for full reference analysis."""
-#     stems:            dict[str, StemProfile] = field(default_factory=dict)
-#     combined_chroma:  np.ndarray = field(default_factory=lambda: np.empty(0))
-#     sr:               int = 44100
-#     fft_size:         int = 4096
-#     hop_size:         int = 1024
-
-#     @property
-#     def n_frames(self) -> int:
-#         return len(self.combined_chroma)
-
-#     @property
-#     def frame_duration(self) -> float:
-#         return self.hop_size / self.sr
-
-#     def time_of_frame(self, idx: int) -> float:
-#         return idx * self.frame_duration
-
-#     def stem_names(self) -> list[str]:
-#         return list(self.stems.keys())
-
-#     # ---- lookup at a reference frame index ----------------------
-#     def rms_snapshot(self, frame_idx: int) -> dict[str, float]:
-#         """Return {stem_name: rms} at a given reference frame."""
-#         return {name: s.rms_at(frame_idx)
-#                 for name, s in self.stems.items()}
-
-#     def chroma_at(self, frame_idx: int) -> np.ndarray:
-#         if 0 <= frame_idx < len(self.combined_chroma):
-#             return self.combined_chroma[frame_idx]
-#         return np.zeros(12)
-
-#     def serialize(self, path: str):
-#         """Persist to disk (numpy npz + pickle for notes)."""
-#         import pickle, gzip
-#         with gzip.open(path, "wb") as f:
-#             pickle.dump(self, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-#     @staticmethod
-#     def load(path: str) -> "FrequencyMap":
-#         import pickle, gzip
-#         with gzip.open(path, "rb") as f:
-#             return pickle.load(f)
