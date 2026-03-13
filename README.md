@@ -87,7 +87,7 @@ ASE/
 │           └── ReferenceLibrary.swift     # Song selection UI
 │
 └── CMakeLists.txt                   # Standalone C++ build (independent of Xcode/Python)
-Copy
+
 ---
 
 ## Requirements
@@ -243,7 +243,7 @@ Note: This build does not include the pybind11 bindings or the iOS app — it's 
 
 
 Architecture Overview
-Copy┌─────────────────────────────────────────────────────────────────┐
+┌─────────────────────────────────────────────────────────────────┐
 │                     OFFLINE (Python + C++)                       │
 │                                                                 │
 │  Reference Audio ──► Demucs ──► Stem Separation                 │
