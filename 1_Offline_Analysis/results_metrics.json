@@ -1,0 +1,56 @@
+{
+  "simulation_parameters": {
+    "n_reference_frames": 4096,
+    "n_live_frames": 3800,
+    "reference_duration_s": 95.10893424036281,
+    "live_duration_s": 88.2358276643991,
+    "tempo_drift_percent": 2.0000000000000018,
+    "noise_std": 0.08,
+    "lock_delay_frames": 86,
+    "fft_size": 4096,
+    "hop_size": 1024,
+    "sample_rate": 44100
+  },
+  "tracking": {
+    "mean_confidence": 0.9531208422975459,
+    "frames_above_85pct_conf": 94.26315789473684,
+    "frames_above_50pct_conf": 99.86842105263159,
+    "frames_above_thresh": 100.0,
+    "mean_position_error_s": 0.848139396109321,
+    "median_position_error_s": 0.8475283446712019,
+    "p90_position_error_s": 1.5557369614512473,
+    "time_to_lock_s": 0.11609977324263039
+  },
+  "gain_adjustment": {
+    "drums": {
+      "mean_gain_db": 0.0,
+      "std_gain_db": 0.0,
+      "max_gain_db": 0.0,
+      "min_gain_db": 0.0
+    },
+    "bass": {
+      "mean_gain_db": 0.1717915200536379,
+      "std_gain_db": 1.3988790337526926,
+      "max_gain_db": 4.504895130483902,
+      "min_gain_db": -4.5563554621867
+    },
+    "vocals": {
+      "mean_gain_db": 0.21592265334670827,
+      "std_gain_db": 1.3374772462801312,
+      "max_gain_db": 5.013737418200278,
+      "min_gain_db": -4.811048123429838
+    },
+    "other": {
+      "mean_gain_db": 0.13153467761388798,
+      "std_gain_db": 1.3523887093435412,
+      "max_gain_db": 4.614196278687733,
+      "min_gain_db": -4.369759991674637
+    }
+  },
+  "rms_residual_after_correction": {
+    "drums": 0.12053398600254146,
+    "bass": 0.04138226133957189,
+    "vocals": 0.047852001909456175,
+    "other": 0.03925577537207079
+  }
+}

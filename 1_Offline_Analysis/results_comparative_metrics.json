@@ -1,0 +1,40 @@
+{
+  "tracking": {
+    "mean_confidence": 0.9531208422975459,
+    "frames_above_85pct_conf": 94.26315789473684,
+    "frames_above_50pct_conf": 99.86842105263159,
+    "frames_above_thresh": 100.0,
+    "mean_position_error_s": 0.848139396109321,
+    "median_position_error_s": 0.8475283446712019,
+    "p90_position_error_s": 1.5557369614512473,
+    "time_to_lock_s": 0.11609977324263039
+  },
+  "advisory_accuracy_demucs": {
+    "drums": {
+      "MAE_dB": 0.6924698749677061
+    },
+    "bass": {
+      "MAE_dB": 0.6680381505042444
+    },
+    "vocals": {
+      "MAE_dB": 0.6956229311888114
+    },
+    "other": {
+      "MAE_dB": 0.664952934902295
+    }
+  },
+  "advisory_accuracy_hpss": {
+    "drums": {
+      "MAE_dB": 0.6924698749677061
+    },
+    "bass": {
+      "MAE_dB": 9.415562414643796
+    },
+    "vocals": {
+      "MAE_dB": 9.6831243043663
+    },
+    "other": {
+      "MAE_dB": 10.205871036208945
+    }
+  }
+}
