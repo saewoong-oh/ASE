@@ -334,4 +334,3 @@ This means the tracker never achieved 20 consecutive frames above 50% confidence
 
 License
 This project is for educational and research purposes.
-Add to Conversation
